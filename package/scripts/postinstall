@@ -14,42 +14,25 @@ export HOMEBREW_NO_ANALYTICS_MESSAGE_OUTPUT=1
 homebrew_directory="${2:-/opt/homebrew}"
 if [[ ! -d "${homebrew_directory:?}" ]]
 then
-  echo "no directory at ${homebrew_directory}!" >&2
+  echo "No directory at ${homebrew_directory}!" >&2
   exit 1
 fi
 
 # add Git to path
 export PATH="/Library/Developer/CommandLineTools/usr/bin:/Applications/Xcode.app/Contents/Developer/usr/bin:${PATH}"
 
-# helpers for setting/unsetting Git's safe directory setting
-set_git_safe_directory() {
-  if git config --global --get-all safe.directory | grep -q "${1}"
-  then
-    return
-  fi
-  SET_GIT_SAFE_DIRECTORY="${1}"
-  git config --global --add safe.directory "${1}"
-}
-unset_git_safe_directory() {
-  if [[ -z "${SET_GIT_SAFE_DIRECTORY-}" ]]
-  then
-    return
-  fi
-
-  git config --global --unset safe.directory "${1}" || git config --global --unset-all safe.directory
-  if [[ ${SET_GIT_SAFE_DIRECTORY-} == "${1}" ]]
-  then
-    unset SET_GIT_SAFE_DIRECTORY
-  fi
-}
+# avoid writing to user's global config file by overriding HOME
+# https://git-scm.com/docs/git-config#SCOPES
+unset XDG_CONFIG_HOME
+export HOME="${homebrew_directory}"
 
 # reset Git repository
 cd "${homebrew_directory}"
-set_git_safe_directory "${homebrew_directory}"
+git config --global --add safe.directory "${homebrew_directory}"
 git reset --hard
 git checkout --force master
 git branch | grep -v '\*' | xargs -n 1 git branch --delete --force || true
-unset_git_safe_directory "${homebrew_directory}"
+rm "${homebrew_directory}/.gitconfig"
 
 # move to /usr/local if on x86_64
 if [[ $(uname -m) == "x86_64" ]]
@@ -59,10 +42,11 @@ then
     cp -pRL "${homebrew_directory}/.git" "/usr/local/Homebrew/"
     mv "${homebrew_directory}/cache_api" "/usr/local/Homebrew/"
 
-    set_git_safe_directory /usr/local/Homebrew
+    export HOME="/usr/local/Homebrew"
+    git config --global --add safe.directory /usr/local/Homebrew
     git -C /usr/local/Homebrew reset --hard
     git -C /usr/local/Homebrew checkout --force master
-    unset_git_safe_directory /usr/local/Homebrew
+    rm /usr/local/Homebrew/.gitconfig
   else
     mkdir -vp /usr/local/bin
     mv "${homebrew_directory}" "/usr/local/Homebrew/"
@@ -77,20 +61,34 @@ then
 fi
 
 # create missing directories
-mkdir -vp Cellar Frameworks etc include lib opt sbin share var/homebrew/linked
+mkdir -vp Caskroom Cellar Frameworks etc include lib opt sbin share var/homebrew/linked
+
+# optionally define an install user at /var/tmp/.homebrew_pkg_user.plist
+homebrew_pkg_user_plist="/var/tmp/.homebrew_pkg_user.plist"
+if [[ -f "${homebrew_pkg_user_plist}" ]] && [[ -n $(defaults read "${homebrew_pkg_user_plist}" HOMEBREW_PKG_USER) ]]
+then
+  homebrew_pkg_user=$(defaults read /var/tmp/.homebrew_pkg_user HOMEBREW_PKG_USER)
+# otherwise, get valid logged in user
+else
+  homebrew_pkg_user=$(echo "show State:/Users/ConsoleUser" | scutil | awk '/Name :/ { print $3 }')
+fi
 
 # set permissions
-logged_in_user=$(echo "show State:/Users/ConsoleUser" | scutil | awk '/Name :/ { print $3 }')
-group=$(id -gn "${logged_in_user}")
+chmod ug=rwx Caskroom Cellar Frameworks bin etc include lib opt sbin share var var/homebrew var/homebrew/linked
 if [[ "${homebrew_directory}" == "/usr/local/Homebrew" ]]
 then
-  chown -R "${logged_in_user}:${group}" Cellar Frameworks Homebrew bin etc include lib sbin share var/homebrew/linked
+  chown -h "${homebrew_pkg_user}:admin" bin bin/brew etc include lib opt sbin share var
+  chown -h -R "${homebrew_pkg_user}:admin" Caskroom Cellar Frameworks Homebrew var/homebrew
+  chown -h -R "${homebrew_pkg_user}" etc include share var
 else
-  chown -R "${logged_in_user}:${group}" .
+  chown -R "${homebrew_pkg_user}:admin" .
 fi
 
 # move API cache to ~/Library/Caches/Homebrew
-user_api_cache_dir=~"${logged_in_user}"/Library/Caches/Homebrew/api
+user_home_dir=$(dscl . read /Users/"${homebrew_pkg_user}" NFSHomeDirectory | awk '{ print $2 }')
+user_cache_dir="${user_home_dir}/Library/Caches/Homebrew"
+user_api_cache_dir="${user_cache_dir}/api"
 mkdir -vp "${user_api_cache_dir}"
 mv -v "${homebrew_directory}/cache_api/"* "${user_api_cache_dir}"
+chown -R "${homebrew_pkg_user}:staff" "${user_cache_dir}"
 rm -vrf "${homebrew_directory}/cache_api"

@@ -1,10 +1,10 @@
-# typed: true
+# typed: true # rubocop:todo Sorbet/StrictSigil
 # frozen_string_literal: true
+
+require "utils/svn"
 
 module Homebrew
   # Auditor for checking common violations in {Resource}s.
-  #
-  # @api private
   class ResourceAuditor
     include Utils::Curl
 
@@ -91,7 +91,8 @@ module Homebrew
 
     def audit_checksum
       return if spec_name == :head
-      # rubocop:disable Style/InvertibleUnlessCondition (non-invertible)
+      # This condition is non-invertible.
+      # rubocop:disable Style/InvertibleUnlessCondition
       return unless DownloadStrategyDetector.detect(url, using) <= CurlDownloadStrategy
       # rubocop:enable Style/InvertibleUnlessCondition
 
@@ -110,8 +111,18 @@ module Homebrew
       return unless url.match?(%r{^https?://files\.pythonhosted\.org/packages/})
       return if name == owner.name # Skip the top-level package name as we only care about `resource "foo"` blocks.
 
-      url =~ %r{/(?<package_name>[^/]+)-}
-      pypi_package_name = Regexp.last_match(:package_name).to_s.gsub(/[_.]/, "-")
+      if url.end_with? ".whl"
+        path = URI(url).path
+        return unless path.present?
+
+        pypi_package_name, = File.basename(path).split("-", 2)
+      else
+        url =~ %r{/(?<package_name>[^/]+)-}
+        pypi_package_name = Regexp.last_match(:package_name).to_s
+      end
+
+      T.must(pypi_package_name).gsub!(/[_.]/, "-")
+
       return if name.casecmp(pypi_package_name).zero?
 
       problem "resource name should be `#{pypi_package_name}` to match the PyPI package name"
@@ -143,13 +154,19 @@ module Homebrew
           if (http_content_problem = curl_check_http_content(
             url,
             "source URL",
-            specs:             specs,
+            specs:,
             use_homebrew_curl: @use_homebrew_curl,
           ))
             problem http_content_problem
           end
         elsif strategy <= GitDownloadStrategy
-          problem "The URL #{url} is not a valid git URL" unless Utils::Git.remote_exists? url
+          attempts = 0
+          remote_exists = T.let(false, T::Boolean)
+          while !remote_exists && attempts < Homebrew::EnvConfig.curl_retries.to_i
+            remote_exists = Utils::Git.remote_exists?(url)
+            attempts += 1
+          end
+          problem "The URL #{url} is not a valid git URL" unless remote_exists
         elsif strategy <= SubversionDownloadStrategy
           next unless DevelopmentTools.subversion_handles_most_https_certificates?
           next unless Utils::Svn.available?
@@ -165,6 +182,7 @@ module Homebrew
       return if spec_name != :head
       return unless Utils::Git.remote_exists?(url)
       return if specs[:tag].present?
+      return if specs[:revision].present?
 
       branch = Utils.popen_read("git", "ls-remote", "--symref", url, "HEAD")
                     .match(%r{ref: refs/heads/(.*?)\s+HEAD})&.to_a&.second
